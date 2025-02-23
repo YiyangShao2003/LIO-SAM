@@ -125,24 +125,28 @@ public:
         pubImuOdometry->publish(laserOdometry);
 
         // publish tf
-        if(lidarFrame != baselinkFrame)
+        // if(lidarFrame != "base_link_slam_liosam")
+        if(true)
         {
-            try
-            {
-                tf2::fromMsg(tfBuffer->lookupTransform(
-                    lidarFrame, baselinkFrame, rclcpp::Time(0)), lidar2Baselink);
-            }
-            catch (tf2::TransformException ex)
-            {
-                RCLCPP_ERROR(get_logger(), "%s", ex.what());
-            }
+            // try
+            // {
+            //     tf2::fromMsg(tfBuffer->lookupTransform(
+            //         lidarFrame, "base_link_slam_liosam", rclcpp::Time(0)), lidar2Baselink);
+            // }
+            // catch (tf2::TransformException ex)
+            // {
+            //     RCLCPP_ERROR(get_logger(), "%s", ex.what());
+            // }
+            geometry_msgs::msg::TransformStamped tf_unit;
+            tf_unit.transform.rotation.w = 1;
+            tf2::fromMsg(tf_unit, lidar2Baselink);
             tf2::Stamped<tf2::Transform> tb(
-                tCur * lidar2Baselink, tf2_ros::fromMsg(odomMsg->header.stamp), odometryFrame);
+                tCur * lidar2Baselink, tf2_ros::fromMsg(odomMsg->header.stamp), "odom");
             tCur = tb;
         }
         geometry_msgs::msg::TransformStamped ts;
         tf2::convert(tCur, ts);
-        ts.child_frame_id = baselinkFrame;
+        ts.child_frame_id = "base_link_slam_liosam";
         tfBroadcaster->sendTransform(ts);
 
         // publish IMU path
@@ -154,7 +158,7 @@ public:
             last_path_time = imuTime;
             geometry_msgs::msg::PoseStamped pose_stamped;
             pose_stamped.header.stamp = imuOdomQueue.back().header.stamp;
-            pose_stamped.header.frame_id = odometryFrame;
+            pose_stamped.header.frame_id = "odom";
             pose_stamped.pose = laserOdometry.pose.pose;
             imuPath.poses.push_back(pose_stamped);
             while(!imuPath.poses.empty() && stamp2Sec(imuPath.poses.front().header.stamp) < lidarOdomTime - 1.0)
@@ -162,7 +166,7 @@ public:
             if (pubImuPath->get_subscription_count() != 0)
             {
                 imuPath.header.stamp = imuOdomQueue.back().header.stamp;
-                imuPath.header.frame_id = odometryFrame;
+                imuPath.header.frame_id = "odom";
                 pubImuPath->publish(imuPath);
             }
         }
@@ -177,6 +181,7 @@ public:
 
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr subImu;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subOdometry;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subVelocity;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubImuOdometry;
 
     rclcpp::CallbackGroup::SharedPtr callbackGroupImu;
@@ -197,11 +202,18 @@ public:
 
     std::deque<sensor_msgs::msg::Imu> imuQueOpt;
     std::deque<sensor_msgs::msg::Imu> imuQueImu;
+    sensor_msgs::msg::Imu latestImu;
+    bool ImuInited = false;
 
     gtsam::Pose3 prevPose_;
     gtsam::Vector3 prevVel_;
     gtsam::NavState prevState_;
     gtsam::imuBias::ConstantBias prevBias_;
+    Eigen::Vector3d odomSinceLastOpt_ = Eigen::Vector3d(0, 0, 0);
+    Eigen::Matrix3d RotSinceLastOpt_ = Eigen::Matrix3d::Identity();
+
+    gtsam::Vector3 obsVel_;
+    bool obsVelInited = false;
 
     gtsam::NavState prevStateOdom;
     gtsam::imuBias::ConstantBias prevBiasOdom;
@@ -209,6 +221,10 @@ public:
     bool doneFirstOpt = false;
     double lastImuT_imu = -1;
     double lastImuT_opt = -1;
+    double lastVelT = -1;
+    rclcpp::Time lastImuTimestamp_imu = this->now();
+    rclcpp::Time lastImuTimestamp_opt = this->now();
+    rclcpp::Time lastVelTimestamp = this->now();
 
     gtsam::ISAM2 optimizer;
     gtsam::NonlinearFactorGraph graphFactors;
@@ -235,12 +251,17 @@ public:
         odomOpt.callback_group = callbackGroupOdom;
 
         subImu = create_subscription<sensor_msgs::msg::Imu>(
-            imuTopic, qos_imu,
+            imuTopic, rclcpp::SensorDataQoS(),
             std::bind(&IMUPreintegration::imuHandler, this, std::placeholders::_1),
             imuOpt);
         subOdometry = create_subscription<nav_msgs::msg::Odometry>(
             "lio_sam/mapping/odometry_incremental", qos,
             std::bind(&IMUPreintegration::odometryHandler, this, std::placeholders::_1),
+            odomOpt);
+
+        subVelocity = create_subscription<nav_msgs::msg::Odometry>(
+            "gimbal_vel", rclcpp::SystemDefaultsQoS(),
+            std::bind(&IMUPreintegration::velHandler, this, std::placeholders::_1),
             odomOpt);
 
         pubImuOdometry = create_publisher<nav_msgs::msg::Odometry>(odomTopic+"_incremental", qos_imu);
@@ -279,6 +300,7 @@ public:
     void resetParams()
     {
         lastImuT_imu = -1;
+        lastVelT = -1;
         doneFirstOpt = false;
         systemInitialized = false;
     }
@@ -315,6 +337,7 @@ public:
                 if (stamp2Sec(imuQueOpt.front().header.stamp) < currentCorrectionTime - delta_t)
                 {
                     lastImuT_opt = stamp2Sec(imuQueOpt.front().header.stamp);
+                    lastImuTimestamp_opt = imuQueOpt.front().header.stamp;
                     imuQueOpt.pop_front();
                 }
                 else
@@ -389,12 +412,21 @@ public:
             double imuTime = stamp2Sec(thisImu->header.stamp);
             if (imuTime < currentCorrectionTime - delta_t)
             {
-                double dt = (lastImuT_opt < 0) ? (1.0 / 500.0) : (imuTime - lastImuT_opt);
+                if (lastImuT_opt < 0)
+                {
+                    lastImuT_opt = imuTime;
+                    lastImuTimestamp_opt = thisImu->header.stamp;
+                }
+                rclcpp::Time thisImuTimestamp = thisImu->header.stamp;
+                rclcpp::Duration dt_ = thisImuTimestamp - lastImuTimestamp_opt;
+                double dt = dt_.seconds();
+                dt = (dt <= 0) ? (1.0 / 500) : dt;
                 imuIntegratorOpt_->integrateMeasurement(
                         gtsam::Vector3(thisImu->linear_acceleration.x, thisImu->linear_acceleration.y, thisImu->linear_acceleration.z),
                         gtsam::Vector3(thisImu->angular_velocity.x,    thisImu->angular_velocity.y,    thisImu->angular_velocity.z), dt);
                 
                 lastImuT_opt = imuTime;
+                lastImuTimestamp_opt = thisImuTimestamp;
                 imuQueOpt.pop_front();
             }
             else
@@ -411,6 +443,14 @@ public:
         gtsam::Pose3 curPose = lidarPose.compose(lidar2Imu);
         gtsam::PriorFactor<gtsam::Pose3> pose_factor(X(key), curPose, degenerate ? correctionNoise2 : correctionNoise);
         graphFactors.add(pose_factor);
+        // add velocity factor
+        if (obsVelInited)
+        {
+            gtsam::noiseModel::Diagonal::shared_ptr velocityNoise = gtsam::noiseModel::Diagonal::Sigmas(gtsam::Vector3(0.1, 0.1, 0.1));
+            gtsam::PriorFactor<gtsam::Vector3> vel_factor(V(key), obsVel_, velocityNoise);
+            graphFactors.add(vel_factor);
+            obsVelInited = false;
+        }
         // insert predicted values
         gtsam::NavState propState_ = imuIntegratorOpt_->predict(prevState_, prevBias_);
         graphValues.insert(X(key), propState_.pose());
@@ -442,9 +482,11 @@ public:
         prevBiasOdom  = prevBias_;
         // first pop imu message older than current correction data
         double lastImuQT = -1;
+        rclcpp::Time lastImuQTimestamp;
         while (!imuQueImu.empty() && stamp2Sec(imuQueImu.front().header.stamp) < currentCorrectionTime - delta_t)
         {
             lastImuQT = stamp2Sec(imuQueImu.front().header.stamp);
+            lastImuQTimestamp = imuQueImu.front().header.stamp;
             imuQueImu.pop_front();
         }
         // repropogate
@@ -457,8 +499,16 @@ public:
             {
                 sensor_msgs::msg::Imu *thisImu = &imuQueImu[i];
                 double imuTime = stamp2Sec(thisImu->header.stamp);
-                double dt = (lastImuQT < 0) ? (1.0 / 500.0) :(imuTime - lastImuQT);
-
+                if (lastImuQT < 0)
+                {
+                    lastImuQT = imuTime;
+                    lastImuQTimestamp = thisImu->header.stamp;
+                }
+                // double dt = (lastImuQT < 0) ? (1.0 / 500.0) :(imuTime - lastImuQT);
+                rclcpp::Time thisImuTimestamp = thisImu->header.stamp;
+                rclcpp::Duration dt_ = thisImuTimestamp - lastImuQTimestamp;
+                double dt = dt_.seconds();
+                dt = (dt <= 0) ? (1.0 / 500) : dt;
                 imuIntegratorImu_->integrateMeasurement(gtsam::Vector3(thisImu->linear_acceleration.x, thisImu->linear_acceleration.y, thisImu->linear_acceleration.z),
                                                         gtsam::Vector3(thisImu->angular_velocity.x,    thisImu->angular_velocity.y,    thisImu->angular_velocity.z), dt);
                 lastImuQT = imuTime;
@@ -466,7 +516,98 @@ public:
         }
 
         ++key;
+        odomSinceLastOpt_ = Eigen::Vector3d(0, 0, 0);
+        RotSinceLastOpt_ = Eigen::Matrix3d::Identity();
         doneFirstOpt = true;
+    }
+
+    void velHandler(const nav_msgs::msg::Odometry::SharedPtr odomMsg)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        double currentCorrectionTime = stamp2Sec(odomMsg->header.stamp);
+
+        // make sure we have imu data to convert velocity in local frame into odom frame
+        if (!ImuInited)
+            return;
+        // make sure we have odometry data
+        if (doneFirstOpt == false)
+            return;
+
+        // local velocity
+        Eigen::Vector3d vel(odomMsg->twist.twist.linear.x, odomMsg->twist.twist.linear.y, odomMsg->twist.twist.linear.z);
+        // rotation matrix from local frame to odom frame extracted from imu orientation
+        geometry_msgs::msg::Quaternion orientation = latestImu.orientation;
+        Eigen::Quaterniond q(orientation.w, orientation.x, orientation.y, orientation.z);
+        Eigen::Matrix3d R = q.toRotationMatrix();
+        // global velocity
+        Eigen::Vector3d velGlobal = R * vel;
+        obsVel_ = gtsam::Vector3(velGlobal.x(), velGlobal.y(), velGlobal.z());
+        // calculate time interval
+        double thisVelT = stamp2Sec(odomMsg->header.stamp);
+        // double dt = (lastVelT < 0) ? (1.0 / 500.0) : (thisVelT - lastVelT);
+        if (lastVelT < 0)
+        {
+            lastVelT = thisVelT;
+            lastVelTimestamp = odomMsg->header.stamp;
+        }
+        rclcpp::Time thisVelTimestamp = odomMsg->header.stamp;
+        rclcpp::Duration dt_ = thisVelTimestamp - lastVelTimestamp;
+        double dt = dt_.seconds();
+        dt = (dt <= 0) ? (1.0 / 500) : dt;
+        lastVelT = thisVelT;
+        lastVelTimestamp = thisVelTimestamp;
+        // predict odometry
+        // position
+        Eigen::Vector3d velCur(odomMsg->twist.twist.linear.x, odomMsg->twist.twist.linear.y, odomMsg->twist.twist.linear.z);
+        odomSinceLastOpt_ += velCur * dt;
+        // // orientation
+
+        // imuIntegratorImu_->integrateMeasurement(gtsam::Vector3(latestImu.linear_acceleration.x, latestImu.linear_acceleration.y, latestImu.linear_acceleration.z),
+        //                                         gtsam::Vector3(latestImu.angular_velocity.x,    latestImu.angular_velocity.y,    latestImu.angular_velocity.z), dt);
+        // gtsam::NavState currentState = imuIntegratorImu_->predict(prevStateOdom, prevBiasOdom);
+        // gtsam::Pose3 imuPose = gtsam::Pose3(currentState.quaternion(), currentState.position());
+        // gtsam::Pose3 lidarPose = imuPose.compose(imu2Lidar);
+        // // extract pose in last optimization
+        // gtsam::Pose3 oldPose(prevStateOdom.quaternion(), prevStateOdom.position());
+        // Eigen::Vector3d oldPoseEigen(oldPose.translation().x(), oldPose.translation().y(), oldPose.translation().z());
+        // // publish odometry
+        // auto odometry = nav_msgs::msg::Odometry();
+        // odometry.header.stamp = odomMsg->header.stamp;
+        // odometry.header.frame_id = "odom";
+        // odometry.child_frame_id = "odom_imu";
+
+        // // odometry.pose.pose.position.x = lidarPose.translation().x();
+        // // odometry.pose.pose.position.y = lidarPose.translation().y();
+        // // odometry.pose.pose.position.z = lidarPose.translation().z();
+        // Eigen::Vector3d pose = oldPoseEigen + odomSinceLastOpt_;
+        // odometry.pose.pose.position.x = pose.x();
+        // odometry.pose.pose.position.y = pose.y();
+        // odometry.pose.pose.position.z = pose.z();
+        // odometry.pose.pose.orientation.x = lidarPose.rotation().toQuaternion().x();
+        // odometry.pose.pose.orientation.y = lidarPose.rotation().toQuaternion().y();
+        // odometry.pose.pose.orientation.z = lidarPose.rotation().toQuaternion().z();
+        // odometry.pose.pose.orientation.w = lidarPose.rotation().toQuaternion().w();
+        // // odometry.pose.pose.orientation.x = orientation.x;
+        // // odometry.pose.pose.orientation.y = orientation.y;
+        // // odometry.pose.pose.orientation.z = orientation.z;
+        // // odometry.pose.pose.orientation.w = orientation.w;
+        
+        // // odometry.twist.twist.linear.x = currentState.velocity().x();
+        // // odometry.twist.twist.linear.y = currentState.velocity().y();
+        // // odometry.twist.twist.linear.z = currentState.velocity().z();
+        // // odometry.twist.twist.angular.x = odomMsg->angular_velocity.x + prevBiasOdom.gyroscope().x();
+        // // odometry.twist.twist.angular.y = odomMsg->angular_velocity.y + prevBiasOdom.gyroscope().y();
+        // // odometry.twist.twist.angular.z = odomMsg->angular_velocity.z + prevBiasOdom.gyroscope().z();
+        // odometry.twist.twist.linear.x = velGlobal.x();
+        // odometry.twist.twist.linear.y = velGlobal.y();
+        // odometry.twist.twist.linear.z = velGlobal.z();
+        // odometry.twist.twist.angular.x = odomMsg->twist.twist.angular.x + prevBiasOdom.gyroscope().x();
+        // odometry.twist.twist.angular.y = odomMsg->twist.twist.angular.y + prevBiasOdom.gyroscope().y();
+        // odometry.twist.twist.angular.z = odomMsg->twist.twist.angular.z + prevBiasOdom.gyroscope().z();
+        // pubImuOdometry->publish(odometry);
+
+        // obsVelInited = true;
     }
 
     bool failureDetection(const gtsam::Vector3& velCur, const gtsam::imuBias::ConstantBias& biasCur)
@@ -493,7 +634,13 @@ public:
     {
         std::lock_guard<std::mutex> lock(mtx);
 
-        sensor_msgs::msg::Imu thisImu = imuConverter(*imu_raw);
+        // sensor_msgs::msg::Imu thisImu = imuConverter(*imu_raw);
+        sensor_msgs::msg::Imu thisImu;
+        if (!imuConverter(*imu_raw, thisImu))
+            return;
+
+        latestImu = thisImu;
+        ImuInited = true;
 
         imuQueOpt.push_back(thisImu);
         imuQueImu.push_back(thisImu);
@@ -503,36 +650,48 @@ public:
 
         double imuTime = stamp2Sec(thisImu.header.stamp);
         double dt = (lastImuT_imu < 0) ? (1.0 / 500.0) : (imuTime - lastImuT_imu);
+        dt = (dt <= 0) ? (1.0 / 500) : dt;
         lastImuT_imu = imuTime;
 
-        // integrate this single imu message
-        imuIntegratorImu_->integrateMeasurement(gtsam::Vector3(thisImu.linear_acceleration.x, thisImu.linear_acceleration.y, thisImu.linear_acceleration.z),
-                                                gtsam::Vector3(thisImu.angular_velocity.x,    thisImu.angular_velocity.y,    thisImu.angular_velocity.z), dt);
+        // predict pose based on encoder data
+        gtsam::Pose3 oldPose(prevStateOdom.quaternion(), prevStateOdom.position());
+        Eigen::Vector3d oldPoseEigen(oldPose.translation().x(), oldPose.translation().y(), oldPose.translation().z());
+        Eigen::Vector3d pose = oldPoseEigen + odomSinceLastOpt_;
 
-        // predict odometry
-        gtsam::NavState currentState = imuIntegratorImu_->predict(prevStateOdom, prevBiasOdom);
+        // predict orientation
+        geometry_msgs::msg::Quaternion orientation = thisImu.orientation;
+        Eigen::Quaterniond q(orientation.w, orientation.x, orientation.y, orientation.z);
+        Eigen::Matrix3d R = q.toRotationMatrix();
+        Eigen::Vector3d omega = Eigen::Vector3d(thisImu.angular_velocity.x, thisImu.angular_velocity.y, thisImu.angular_velocity.z);
+        Eigen::Vector3d rotation_vector = omega * dt;
+        Eigen::AngleAxisd rotation_vector_(rotation_vector.norm(), rotation_vector.normalized());
+        Eigen::Matrix3d R_ = rotation_vector_.toRotationMatrix();
+        RotSinceLastOpt_ = RotSinceLastOpt_ * R_;
+        Eigen::Matrix3d R__ = R * RotSinceLastOpt_;
+        Eigen::Quaterniond q_(R__);
+
 
         // publish odometry
         auto odometry = nav_msgs::msg::Odometry();
         odometry.header.stamp = thisImu.header.stamp;
-        odometry.header.frame_id = odometryFrame;
+        odometry.header.frame_id = "odom";
         odometry.child_frame_id = "odom_imu";
 
-        // transform imu pose to ldiar
-        gtsam::Pose3 imuPose = gtsam::Pose3(currentState.quaternion(), currentState.position());
-        gtsam::Pose3 lidarPose = imuPose.compose(imu2Lidar);
+        odometry.pose.pose.position.x = pose.x();
+        odometry.pose.pose.position.y = pose.y();
+        odometry.pose.pose.position.z = pose.z();
+        // odometry.pose.pose.orientation.x = lidarPose.rotation().toQuaternion().x();
+        // odometry.pose.pose.orientation.y = lidarPose.rotation().toQuaternion().y();
+        // odometry.pose.pose.orientation.z = lidarPose.rotation().toQuaternion().z();
+        // odometry.pose.pose.orientation.w = lidarPose.rotation().toQuaternion().w();
+        odometry.pose.pose.orientation.x = q_.x();
+        odometry.pose.pose.orientation.y = q_.y();
+        odometry.pose.pose.orientation.z = q_.z();
+        odometry.pose.pose.orientation.w = q_.w();
 
-        odometry.pose.pose.position.x = lidarPose.translation().x();
-        odometry.pose.pose.position.y = lidarPose.translation().y();
-        odometry.pose.pose.position.z = lidarPose.translation().z();
-        odometry.pose.pose.orientation.x = lidarPose.rotation().toQuaternion().x();
-        odometry.pose.pose.orientation.y = lidarPose.rotation().toQuaternion().y();
-        odometry.pose.pose.orientation.z = lidarPose.rotation().toQuaternion().z();
-        odometry.pose.pose.orientation.w = lidarPose.rotation().toQuaternion().w();
-        
-        odometry.twist.twist.linear.x = currentState.velocity().x();
-        odometry.twist.twist.linear.y = currentState.velocity().y();
-        odometry.twist.twist.linear.z = currentState.velocity().z();
+        odometry.twist.twist.linear.x = prevState_.velocity().x();
+        odometry.twist.twist.linear.y = prevState_.velocity().y();
+        odometry.twist.twist.linear.z = prevState_.velocity().z();
         odometry.twist.twist.angular.x = thisImu.angular_velocity.x + prevBiasOdom.gyroscope().x();
         odometry.twist.twist.angular.y = thisImu.angular_velocity.y + prevBiasOdom.gyroscope().y();
         odometry.twist.twist.angular.z = thisImu.angular_velocity.z + prevBiasOdom.gyroscope().z();

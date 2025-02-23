@@ -15,6 +15,8 @@
 #include <nav_msgs/msg/path.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
+#include "livox_ros_driver2/msg/custom_point.hpp"
+#include "livox_ros_driver2/msg/custom_msg.hpp"
 
 #include <opencv2/opencv.hpp>
 
@@ -39,6 +41,8 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+
+#include <Eigen/Dense>
 
 #include <vector>
 #include <cmath>
@@ -68,6 +72,9 @@ class ParamServer : public rclcpp::Node
 {
 public:
     std::string robot_id;
+
+    // verbose
+    bool verbose;
 
     //Topics
     string pointCloudTopic;
@@ -154,6 +161,9 @@ public:
 
     ParamServer(std::string node_name, const rclcpp::NodeOptions & options) : Node(node_name, options)
     {
+        declare_parameter("verbose", false);
+        get_parameter("verbose", verbose);
+
         declare_parameter("pointCloudTopic", "points");
         get_parameter("pointCloudTopic", pointCloudTopic);
         declare_parameter("imuTopic", "imu/data");
@@ -165,7 +175,7 @@ public:
 
         declare_parameter("lidarFrame", "laser_data_frame");
         get_parameter("lidarFrame", lidarFrame);
-        declare_parameter("baselinkFrame", "base_link");
+        declare_parameter("baselinkFrame", "base_link_slam");
         get_parameter("baselinkFrame", baselinkFrame);
         declare_parameter("odometryFrame", "odom");
         get_parameter("odometryFrame", odometryFrame);
@@ -308,12 +318,74 @@ public:
         declare_parameter("globalMapVisualizationLeafSize", 1.0);
         get_parameter("globalMapVisualizationLeafSize", globalMapVisualizationLeafSize);
 
+        // print parameters
+        RCLCPP_INFO(get_logger(), "verbose: %d", verbose);
+        if (verbose)
+        {
+            RCLCPP_INFO(get_logger(), "------------------------------------------------------");
+            RCLCPP_INFO(get_logger(), "pointCloudTopic: %s", pointCloudTopic.c_str());
+            RCLCPP_INFO(get_logger(), "imuTopic: %s", imuTopic.c_str());
+            RCLCPP_INFO(get_logger(), "odomTopic: %s", odomTopic.c_str());
+            RCLCPP_INFO(get_logger(), "gpsTopic: %s", gpsTopic.c_str());
+            RCLCPP_INFO(get_logger(), "lidarFrame: %s", lidarFrame.c_str());
+            RCLCPP_INFO(get_logger(), "baselinkFrame: %s", baselinkFrame.c_str());
+            RCLCPP_INFO(get_logger(), "odometryFrame: %s", odometryFrame.c_str());
+            RCLCPP_INFO(get_logger(), "mapFrame: %s", mapFrame.c_str());
+            RCLCPP_INFO(get_logger(), "useImuHeadingInitialization: %d", useImuHeadingInitialization);
+            RCLCPP_INFO(get_logger(), "useGpsElevation: %d", useGpsElevation);
+            RCLCPP_INFO(get_logger(), "gpsCovThreshold: %f", gpsCovThreshold);
+            RCLCPP_INFO(get_logger(), "poseCovThreshold: %f", poseCovThreshold);
+            RCLCPP_INFO(get_logger(), "savePCD: %d", savePCD);
+            RCLCPP_INFO(get_logger(), "savePCDDirectory: %s", savePCDDirectory.c_str());
+            RCLCPP_INFO(get_logger(), "sensor: %s", sensorStr.c_str());
+            RCLCPP_INFO(get_logger(), "N_SCAN: %d", N_SCAN);
+            RCLCPP_INFO(get_logger(), "Horizon_SCAN: %d", Horizon_SCAN);
+            RCLCPP_INFO(get_logger(), "downsampleRate: %d", downsampleRate);
+            RCLCPP_INFO(get_logger(), "lidarMinRange: %f", lidarMinRange);
+            RCLCPP_INFO(get_logger(), "lidarMaxRange: %f", lidarMaxRange);
+            RCLCPP_INFO(get_logger(), "imuAccNoise: %f", imuAccNoise);
+            RCLCPP_INFO(get_logger(), "imuGyrNoise: %f", imuGyrNoise);
+            RCLCPP_INFO(get_logger(), "imuAccBiasN: %f", imuAccBiasN);
+            RCLCPP_INFO(get_logger(), "imuGyrBiasN: %f", imuGyrBiasN);
+            RCLCPP_INFO(get_logger(), "imuGravity: %f", imuGravity);
+            RCLCPP_INFO(get_logger(), "imuRPYWeight: %f", imuRPYWeight);
+            RCLCPP_INFO(get_logger(), "extrinsicRot: %f %f %f %f %f %f %f %f %f", extRot(0, 0), extRot(0, 1), extRot(0, 2), extRot(1, 0), extRot(1, 1), extRot(1, 2), extRot(2, 0), extRot(2, 1), extRot(2, 2));
+            RCLCPP_INFO(get_logger(), "extrinsicRPY: %f %f %f %f %f %f %f %f %f", extRPY(0, 0), extRPY(0, 1), extRPY(0, 2), extRPY(1, 0), extRPY(1, 1), extRPY(1, 2), extRPY(2, 0), extRPY(2, 1), extRPY(2, 2));
+            RCLCPP_INFO(get_logger(), "extrinsicTrans: %f %f %f", extTrans(0), extTrans(1), extTrans(2));
+            RCLCPP_INFO(get_logger(), "edgeThreshold: %f", edgeThreshold);
+            RCLCPP_INFO(get_logger(), "surfThreshold: %f", surfThreshold);
+            RCLCPP_INFO(get_logger(), "edgeFeatureMinValidNum: %d", edgeFeatureMinValidNum);
+            RCLCPP_INFO(get_logger(), "surfFeatureMinValidNum: %d", surfFeatureMinValidNum);
+            RCLCPP_INFO(get_logger(), "odometrySurfLeafSize: %f", odometrySurfLeafSize);
+            RCLCPP_INFO(get_logger(), "mappingCornerLeafSize: %f", mappingCornerLeafSize);
+            RCLCPP_INFO(get_logger(), "mappingSurfLeafSize: %f", mappingSurfLeafSize);
+            RCLCPP_INFO(get_logger(), "z_tollerance: %f", z_tollerance);
+            RCLCPP_INFO(get_logger(), "rotation_tollerance: %f", rotation_tollerance);
+            RCLCPP_INFO(get_logger(), "numberOfCores: %d", numberOfCores);
+            RCLCPP_INFO(get_logger(), "mappingProcessInterval: %f", mappingProcessInterval);
+            RCLCPP_INFO(get_logger(), "surroundingkeyframeAddingDistThreshold: %f", surroundingkeyframeAddingDistThreshold);
+            RCLCPP_INFO(get_logger(), "surroundingkeyframeAddingAngleThreshold: %f", surroundingkeyframeAddingAngleThreshold);
+            RCLCPP_INFO(get_logger(), "surroundingKeyframeDensity: %f", surroundingKeyframeDensity);
+            RCLCPP_INFO(get_logger(), "surroundingKeyframeSearchRadius: %f", surroundingKeyframeSearchRadius);
+            RCLCPP_INFO(get_logger(), "loopClosureEnableFlag: %d", loopClosureEnableFlag);
+            RCLCPP_INFO(get_logger(), "loopClosureFrequency: %f", loopClosureFrequency);
+            RCLCPP_INFO(get_logger(), "surroundingKeyframeSize: %d", surroundingKeyframeSize);
+            RCLCPP_INFO(get_logger(), "historyKeyframeSearchRadius: %f", historyKeyframeSearchRadius);
+            RCLCPP_INFO(get_logger(), "historyKeyframeSearchTimeDiff: %f", historyKeyframeSearchTimeDiff);
+            RCLCPP_INFO(get_logger(), "historyKeyframeSearchNum: %d", historyKeyframeSearchNum);
+            RCLCPP_INFO(get_logger(), "historyKeyframeFitnessScore: %f", historyKeyframeFitnessScore);
+            RCLCPP_INFO(get_logger(), "globalMapVisualizationSearchRadius: %f", globalMapVisualizationSearchRadius);
+            RCLCPP_INFO(get_logger(), "globalMapVisualizationPoseDensity: %f", globalMapVisualizationPoseDensity);
+            RCLCPP_INFO(get_logger(), "globalMapVisualizationLeafSize: %f", globalMapVisualizationLeafSize);
+            RCLCPP_INFO(get_logger(), "------------------------------------------------------");
+        }
+
         usleep(100);
     }
 
-    sensor_msgs::msg::Imu imuConverter(const sensor_msgs::msg::Imu& imu_in)
+    bool imuConverter(const sensor_msgs::msg::Imu& imu_in, sensor_msgs::msg::Imu& imu_out)
     {
-        sensor_msgs::msg::Imu imu_out = imu_in;
+        imu_out = imu_in;
         // rotate acceleration
         Eigen::Vector3d acc(imu_in.linear_acceleration.x, imu_in.linear_acceleration.y, imu_in.linear_acceleration.z);
         acc = extRot * acc;
@@ -337,10 +409,11 @@ public:
         if (sqrt(q_final.x()*q_final.x() + q_final.y()*q_final.y() + q_final.z()*q_final.z() + q_final.w()*q_final.w()) < 0.1)
         {
             RCLCPP_ERROR(get_logger(), "Invalid quaternion, please use a 9-axis IMU!");
-            rclcpp::shutdown();
+            // rclcpp::shutdown();
+            return false;
         }
 
-        return imu_out;
+        return true;
     }
 };
 
@@ -409,7 +482,8 @@ float pointDistance(PointType p1, PointType p2)
 rmw_qos_profile_t qos_profile{
     RMW_QOS_POLICY_HISTORY_KEEP_LAST,
     1,
-    RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+        // RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,    RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
     RMW_QOS_POLICY_DURABILITY_VOLATILE,
     RMW_QOS_DEADLINE_DEFAULT,
     RMW_QOS_LIFESPAN_DEFAULT,
@@ -424,11 +498,18 @@ auto qos = rclcpp::QoS(
         qos_profile.depth
     ),
     qos_profile);
+// auto qos = rclcpp::QoS{
+//     RMW_QOS_POLICY_HISTORY_KEEP_LAST,
+//     10, // Adjust the history depth as needed
+//     RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+//     RMW_QOS_POLICY_DURABILITY_VOLATILE
+// };
 
 rmw_qos_profile_t qos_profile_imu{
     RMW_QOS_POLICY_HISTORY_KEEP_LAST,
     2000,
-    RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+        // RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,    RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
     RMW_QOS_POLICY_DURABILITY_VOLATILE,
     RMW_QOS_DEADLINE_DEFAULT,
     RMW_QOS_LIFESPAN_DEFAULT,
@@ -447,7 +528,8 @@ auto qos_imu = rclcpp::QoS(
 rmw_qos_profile_t qos_profile_lidar{
     RMW_QOS_POLICY_HISTORY_KEEP_LAST,
     5,
-    RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+        // RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,    RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
     RMW_QOS_POLICY_DURABILITY_VOLATILE,
     RMW_QOS_DEADLINE_DEFAULT,
     RMW_QOS_LIFESPAN_DEFAULT,

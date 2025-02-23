@@ -42,7 +42,7 @@ private:
     std::mutex imuLock;
     std::mutex odoLock;
 
-    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subLaserCloud;
+    rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr subLaserCloud;
     rclcpp::CallbackGroup::SharedPtr callbackGroupLidar;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloud;
 
@@ -57,8 +57,8 @@ private:
     rclcpp::CallbackGroup::SharedPtr callbackGroupOdom;
     std::deque<nav_msgs::msg::Odometry> odomQueue;
 
-    std::deque<sensor_msgs::msg::PointCloud2> cloudQueue;
-    sensor_msgs::msg::PointCloud2 currentCloudMsg;
+    std::deque<livox_ros_driver2::msg::CustomMsg> cloudQueue;
+    livox_ros_driver2::msg::CustomMsg currentCloudMsg;
 
     double *imuTime = new double[queueLength];
     double *imuRotX = new double[queueLength];
@@ -110,15 +110,15 @@ public:
         odomOpt.callback_group = callbackGroupOdom;
 
         subImu = create_subscription<sensor_msgs::msg::Imu>(
-            imuTopic, qos_imu,
+            imuTopic, rclcpp::SensorDataQoS(),
             std::bind(&ImageProjection::imuHandler, this, std::placeholders::_1),
             imuOpt);
         subOdom = create_subscription<nav_msgs::msg::Odometry>(
             odomTopic + "_incremental", qos_imu,
             std::bind(&ImageProjection::odometryHandler, this, std::placeholders::_1),
             odomOpt);
-        subLaserCloud = create_subscription<sensor_msgs::msg::PointCloud2>(
-            pointCloudTopic, qos_lidar,
+        subLaserCloud = create_subscription<livox_ros_driver2::msg::CustomMsg>(
+            pointCloudTopic, rclcpp::SystemDefaultsQoS(),
             std::bind(&ImageProjection::cloudHandler, this, std::placeholders::_1),
             lidarOpt);
 
@@ -131,6 +131,7 @@ public:
         resetParameters();
 
         pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
+        columnIdnCountVec = vector<int>(N_SCAN, 0);
     }
 
     void allocateMemory()
@@ -176,7 +177,10 @@ public:
 
     void imuHandler(const sensor_msgs::msg::Imu::SharedPtr imuMsg)
     {
-        sensor_msgs::msg::Imu thisImu = imuConverter(*imuMsg);
+        // sensor_msgs::msg::Imu thisImu = imuConverter(*imuMsg);
+        sensor_msgs::msg::Imu thisImu;
+        if (!imuConverter(*imuMsg, thisImu))
+            return;
 
         std::lock_guard<std::mutex> lock1(imuLock);
         imuQueue.push_back(thisImu);
@@ -205,7 +209,7 @@ public:
         odomQueue.push_back(*odometryMsg);
     }
 
-    void cloudHandler(const sensor_msgs::msg::PointCloud2::SharedPtr laserCloudMsg)
+    void cloudHandler(const livox_ros_driver2::msg::CustomMsg::SharedPtr laserCloudMsg)
     {
         if (!cachePointCloud(laserCloudMsg))
             return;
@@ -222,7 +226,31 @@ public:
         resetParameters();
     }
 
-    bool cachePointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr& laserCloudMsg)
+    void moveFromCustomMsg(livox_ros_driver2::msg::CustomMsg &Msg, pcl::PointCloud<PointXYZIRT> & cloud)
+    {
+        cloud.clear();
+        cloud.reserve(Msg.point_num);
+        PointXYZIRT point;
+
+        cloud.header.frame_id=Msg.header.frame_id;
+        // cloud.header.stamp=Msg.header.stamp.toNSec()/1000;
+        cloud.header.stamp=(uint64_t)(stamp2Sec(Msg.header.stamp) * 1e6);     
+        // cloud.header.seq=Msg.header.seq;
+
+        for(uint i=0;i<Msg.point_num-1;i++)
+        {
+            point.x=Msg.points[i].x; 
+            point.y=Msg.points[i].y; 
+            point.z=Msg.points[i].z; 
+            point.intensity=Msg.points[i].reflectivity; 
+            // point.tag=Msg.points[i].tag; 
+            point.time=Msg.points[i].offset_time*1e-9; 
+            point.ring=Msg.points[i].line; 
+            cloud.push_back(point);
+        }
+    }
+
+    bool cachePointCloud(const livox_ros_driver2::msg::CustomMsg::SharedPtr& laserCloudMsg)
     {
         // cache point cloud
         cloudQueue.push_back(*laserCloudMsg);
@@ -232,28 +260,32 @@ public:
         // convert cloud
         currentCloudMsg = std::move(cloudQueue.front());
         cloudQueue.pop_front();
-        if (sensor == SensorType::VELODYNE || sensor == SensorType::LIVOX)
+        if (sensor == SensorType::LIVOX)
         {
-            pcl::moveFromROSMsg(currentCloudMsg, *laserCloudIn);  
+            moveFromCustomMsg(currentCloudMsg, *laserCloudIn);
         }
-        else if (sensor == SensorType::OUSTER)
-        {
-            // Convert to Velodyne format
-            pcl::moveFromROSMsg(currentCloudMsg, *tmpOusterCloudIn);
-            laserCloudIn->points.resize(tmpOusterCloudIn->size());
-            laserCloudIn->is_dense = tmpOusterCloudIn->is_dense;
-            for (size_t i = 0; i < tmpOusterCloudIn->size(); i++)
-            {
-                auto &src = tmpOusterCloudIn->points[i];
-                auto &dst = laserCloudIn->points[i];
-                dst.x = src.x;
-                dst.y = src.y;
-                dst.z = src.z;
-                dst.intensity = src.intensity;
-                dst.ring = src.ring;
-                dst.time = src.t * 1e-9f;
-            }
-        }
+        // else if (sensor == SensorType::VELODYNE)
+        // {
+        //     pcl::moveFromROSMsg(currentCloudMsg, *laserCloudIn);  
+        // }
+        // else if (sensor == SensorType::OUSTER)
+        // {
+        //     // Convert to Velodyne format
+        //     pcl::moveFromROSMsg(currentCloudMsg, *tmpOusterCloudIn);
+        //     laserCloudIn->points.resize(tmpOusterCloudIn->size());
+        //     laserCloudIn->is_dense = tmpOusterCloudIn->is_dense;
+        //     for (size_t i = 0; i < tmpOusterCloudIn->size(); i++)
+        //     {
+        //         auto &src = tmpOusterCloudIn->points[i];
+        //         auto &dst = laserCloudIn->points[i];
+        //         dst.x = src.x;
+        //         dst.y = src.y;
+        //         dst.z = src.z;
+        //         dst.intensity = src.intensity;
+        //         dst.ring = src.ring;
+        //         dst.time = src.t * 1e-9f;
+        //     }
+        // }
         else
         {
             RCLCPP_ERROR_STREAM(get_logger(), "Unknown sensor type: " << int(sensor));
@@ -278,43 +310,50 @@ public:
 
         // check ring channel
         // we will skip the ring check in case of velodyne - as we calculate the ring value downstream (line 572)
-        if (ringFlag == 0)
-        {
-            ringFlag = -1;
-            for (int i = 0; i < (int)currentCloudMsg.fields.size(); ++i)
-            {
-                if (currentCloudMsg.fields[i].name == "ring")
-                {
-                    ringFlag = 1;
-                    break;
-                }
-            }
-            if (ringFlag == -1)
-            {
-                if (sensor == SensorType::VELODYNE) {
-                    ringFlag = 2;
-                } else {
-                    RCLCPP_ERROR(get_logger(), "Point cloud ring channel not available, please configure your point cloud data!");
-                    rclcpp::shutdown();
-                }
-            }
+        if (sensor == SensorType::LIVOX){
+            ringFlag = 1;
         }
+        // if (ringFlag == 0)
+        // {
+        //     ringFlag = -1;
+        //     for (int i = 0; i < (int)currentCloudMsg.fields.size(); ++i)
+        //     {
+        //         if (currentCloudMsg.fields[i].name == "ring")
+        //         {
+        //             ringFlag = 1;
+        //             break;
+        //         }
+        //     }
+        //     if (ringFlag == -1)
+        //     {
+        //         if (sensor == SensorType::VELODYNE) {
+        //             ringFlag = 2;
+        //         } else {
+        //             RCLCPP_ERROR(get_logger(), "Point cloud ring channel not available, please configure your point cloud data!");
+        //             rclcpp::shutdown();
+        //         }
+        //     }
+        // }
 
         // check point time
-        if (deskewFlag == 0)
+        if (sensor == SensorType::LIVOX)
         {
-            deskewFlag = -1;
-            for (auto &field : currentCloudMsg.fields)
-            {
-                if (field.name == "time" || field.name == "t")
-                {
-                    deskewFlag = 1;
-                    break;
-                }
-            }
-            if (deskewFlag == -1)
-                RCLCPP_WARN(get_logger(), "Point cloud timestamp not available, deskew function disabled, system will drift significantly!");
+            deskewFlag = 1;
         }
+        // if (deskewFlag == 0)
+        // {
+        //     deskewFlag = -1;
+        //     for (auto &field : currentCloudMsg.fields)
+        //     {
+        //         if (field.name == "time" || field.name == "t")
+        //         {
+        //             deskewFlag = 1;
+        //             break;
+        //         }
+        //     }
+        //     if (deskewFlag == -1)
+        //         RCLCPP_WARN(get_logger(), "Point cloud timestamp not available, deskew function disabled, system will drift significantly!");
+        // }
 
         return true;
     }

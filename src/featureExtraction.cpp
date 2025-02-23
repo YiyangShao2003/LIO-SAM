@@ -89,12 +89,14 @@ public:
         int cloudSize = extractedCloud->points.size();
         for (int i = 5; i < cloudSize - 5; i++)
         {
-            float diffRange = cloudInfo.point_range[i-5] + cloudInfo.point_range[i-4]
-                            + cloudInfo.point_range[i-3] + cloudInfo.point_range[i-2]
-                            + cloudInfo.point_range[i-1] - cloudInfo.point_range[i] * 10
-                            + cloudInfo.point_range[i+1] + cloudInfo.point_range[i+2]
-                            + cloudInfo.point_range[i+3] + cloudInfo.point_range[i+4]
-                            + cloudInfo.point_range[i+5];
+            // float diffRange = cloudInfo.point_range[i-5] + cloudInfo.point_range[i-4]
+            //                 + cloudInfo.point_range[i-3] + cloudInfo.point_range[i-2]
+            //                 + cloudInfo.point_range[i-1] - cloudInfo.point_range[i] * 10
+            //                 + cloudInfo.point_range[i+1] + cloudInfo.point_range[i+2]
+            //                 + cloudInfo.point_range[i+3] + cloudInfo.point_range[i+4]
+            //                 + cloudInfo.point_range[i+5];
+            float diffRange = cloudInfo.point_range[i - 2] + cloudInfo.point_range[i - 1] - cloudInfo.point_range[i] * 4
+                            + cloudInfo.point_range[i + 1] + cloudInfo.point_range[i + 2];
 
             cloudCurvature[i] = diffRange*diffRange;//diffX * diffX + diffY * diffY + diffZ * diffZ;
 
@@ -119,26 +121,27 @@ public:
             if (columnDiff < 10){
                 // 10 pixel diff in range image
                 if (depth1 - depth2 > 0.3){
-                    cloudNeighborPicked[i - 5] = 1;
-                    cloudNeighborPicked[i - 4] = 1;
-                    cloudNeighborPicked[i - 3] = 1;
-                    cloudNeighborPicked[i - 2] = 1;
+                    // cloudNeighborPicked[i - 5] = 1;
+                    // cloudNeighborPicked[i - 4] = 1;
+                    // cloudNeighborPicked[i - 3] = 1;
+                    // cloudNeighborPicked[i - 2] = 1;
                     cloudNeighborPicked[i - 1] = 1;
                     cloudNeighborPicked[i] = 1;
                 }else if (depth2 - depth1 > 0.3){
                     cloudNeighborPicked[i + 1] = 1;
                     cloudNeighborPicked[i + 2] = 1;
-                    cloudNeighborPicked[i + 3] = 1;
-                    cloudNeighborPicked[i + 4] = 1;
-                    cloudNeighborPicked[i + 5] = 1;
-                    cloudNeighborPicked[i + 6] = 1;
+                    // cloudNeighborPicked[i + 3] = 1;
+                    // cloudNeighborPicked[i + 4] = 1;
+                    // cloudNeighborPicked[i + 5] = 1;
+                    // cloudNeighborPicked[i + 6] = 1;
                 }
             }
             // parallel beam
             float diff1 = std::abs(float(cloudInfo.point_range[i-1] - cloudInfo.point_range[i]));
             float diff2 = std::abs(float(cloudInfo.point_range[i+1] - cloudInfo.point_range[i]));
 
-            if (diff1 > 0.02 * cloudInfo.point_range[i] && diff2 > 0.02 * cloudInfo.point_range[i])
+            // if (diff1 > 0.02 * cloudInfo.point_range[i] && diff2 > 0.02 * cloudInfo.point_range[i])
+            if (diff1 > 0.1 * cloudInfo.point_range[i] && diff2 > 0.1 * cloudInfo.point_range[i])
                 cloudNeighborPicked[i] = 1;
         }
     }
@@ -173,7 +176,7 @@ public:
                     if (cloudNeighborPicked[ind] == 0 && cloudCurvature[ind] > edgeThreshold)
                     {
                         largestPickedNum++;
-                        if (largestPickedNum <= 20){
+                        if (largestPickedNum <= 40){
                             cloudLabel[ind] = 1;
                             cornerCloud->push_back(extractedCloud->points[ind]);
                         } else {
